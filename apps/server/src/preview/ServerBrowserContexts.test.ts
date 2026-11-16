@@ -1,10 +1,15 @@
+// @effect-diagnostics nodeBuiltinImport:off -- A local HTTP server records what a real browser sends.
 import * as NodeEvents from "node:events";
+import * as NodeHttp from "node:http";
+import type * as NodeNet from "node:net";
 
 import { INCOGNITO_BROWSER_PROFILE_ID } from "@t3tools/contracts";
 import { chromium, type Browser, type BrowserContext, type BrowserType } from "playwright-core";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { ServerBrowserContexts } from "./ServerBrowserContexts.ts";
+import { presentAsChrome, ServerBrowserContexts } from "./ServerBrowserContexts.ts";
+
+const launchBundledBrowser = chromium.launch.bind(chromium);
 
 const launches = vi.hoisted(() => ({
   launch: vi.fn<BrowserType["launch"]>(),
@@ -326,5 +331,66 @@ describe("ServerBrowserContexts", () => {
     await pool.close();
     expect(browser.close).toHaveBeenCalledTimes(1);
     expect(browser.created[0]?.close).toHaveBeenCalled();
+  });
+
+  it("sends one Chrome identity from a page and from its service worker", async () => {
+    // The pool's own launch options, on the browser Playwright bundles for tests.
+    launches.launch.mockImplementation((launch = {}) => {
+      const { executablePath: _installed, ...bundled } = launch;
+      return launchBundledBrowser(bundled);
+    });
+    const server = NodeHttp.createServer((request, response) => {
+      const send = (type: string, body: string) =>
+        response.writeHead(200, { "content-type": type }).end(body);
+      if (request.url === "/worker.js") {
+        return send(
+          "text/javascript",
+          `addEventListener("activate", (event) => event.waitUntil(clients.claim()));
+           addEventListener("fetch", (event) => event.respondWith(fetch(event.request)));`,
+        );
+      }
+      if (request.url === "/identity") {
+        return send(
+          "application/json",
+          JSON.stringify({
+            userAgent: request.headers["user-agent"],
+            brands: request.headers["sec-ch-ua"],
+          }),
+        );
+      }
+      return send("text/html", "<!doctype html>");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const bundled = await launchBundledBrowser();
+    const chromeVersion = bundled.version();
+    await bundled.close();
+    const pool = new ServerBrowserContexts({
+      ...options(),
+      env: { ...process.env, T3CODE_SERVER_BROWSER_SANDBOX: "0" },
+      chrome: { version: chromeVersion, platform: "linux" },
+    });
+    try {
+      const context = await pool.contextFor(INCOGNITO_BROWSER_PROFILE_ID);
+      const page = await context.newPage();
+      await presentAsChrome(await context.newCDPSession(page), { platform: "linux", arch: "x64" });
+      await page.goto(`http://127.0.0.1:${(server.address() as NodeNet.AddressInfo).port}/`);
+      const [fromPage, throughWorker] = (await page.evaluate(`(async () => {
+        const identity = async () => (await fetch("/identity")).json();
+        const fromPage = await identity();
+        const controlled = new Promise((resolve) =>
+          navigator.serviceWorker.addEventListener("controllerchange", resolve, { once: true }),
+        );
+        await navigator.serviceWorker.register("/worker.js");
+        await controlled;
+        return [fromPage, await identity()];
+      })()`)) as ReadonlyArray<{ readonly userAgent: string; readonly brands: string }>;
+      expect(fromPage?.userAgent).toContain(` Chrome/${chromeVersion.split(".")[0]}.0.0.0 `);
+      expect(fromPage?.brands).toContain('"Google Chrome"');
+      expect(throughWorker?.userAgent).toBe(fromPage?.userAgent);
+    } finally {
+      await pool.close();
+      server.closeAllConnections();
+      server.close();
+    }
   });
 });
